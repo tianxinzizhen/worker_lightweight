@@ -25,13 +25,30 @@ type Scheduler struct {
 	lock      lock.Lock
 	cron      *cron.Cron
 	syncEvery time.Duration
+	resyncSig chan struct{} // send to request an out-of-band resync
 }
 
 // NewScheduler returns a scheduler ready to Start. syncEvery controls how
 // often the scheduler refreshes its cron entry table from the database.
 func NewScheduler(s *store.Store, l lock.Lock, syncEvery time.Duration) *Scheduler {
 	c := cron.New(cron.WithSeconds()) // 6-field expressions including seconds
-	return &Scheduler{store: s, lock: l, cron: c, syncEvery: syncEvery}
+	return &Scheduler{
+		store:     s,
+		lock:      l,
+		cron:      c,
+		syncEvery: syncEvery,
+		resyncSig: make(chan struct{}, 1),
+	}
+}
+
+// ResyncNow requests an out-of-band schedule refresh. Non-blocking: drops
+// the signal if a resync is already pending. Used by pause/resume handlers
+// so the effect is immediate instead of waiting up to syncEvery.
+func (s *Scheduler) ResyncNow(ctx context.Context) {
+	select {
+	case s.resyncSig <- struct{}{}:
+	default: // already queued, the pending resync will pick up the change
+	}
 }
 
 // Start launches the cron engine and the sync loop. Cancel ctx to stop.
@@ -49,6 +66,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 			<-stopCtx.Done()
 			return
 		case <-ticker.C:
+			s.resync(ctx)
+		case <-s.resyncSig:
 			s.resync(ctx)
 		}
 	}
@@ -80,7 +99,10 @@ func (s *Scheduler) resync(ctx context.Context) {
 // per-task lock prevents duplicate spawns when ticks overlap (e.g. a slow
 // previous tick still holding the lock at the next fire time).
 func (s *Scheduler) spawn(ctx context.Context, d *model.Task) {
-	token := time.Now().Format("20060102T150405.000")
+	// Use a readable, separator-delimited timestamp so child task names like
+	// "my-cron#2026-09-18 14:46:00.123" are easy to scan and filter by time.
+	// Millisecond precision keeps the token unique for the per-cron lock.
+	token := time.Now().Format("2006-01-02 15:04:05.000")
 	key := "cron:" + d.Name
 	if err := s.lock.Acquire(key, token, 30*time.Second); err != nil {
 		logger.L.Debug("scheduler: spawn skipped, lock held", "task", d.Name)
@@ -95,6 +117,7 @@ func (s *Scheduler) spawn(ctx context.Context, d *model.Task) {
 		Status:     model.StatusPending,
 		MaxRetry:   d.MaxRetry,
 		TimeoutSec: d.TimeoutSec,
+		ParentID:   d.ID,
 	}
 	if err := s.store.Create(ctx, child); err != nil {
 		logger.L.Error("scheduler: spawn child failed", "task", d.Name, "err", err)

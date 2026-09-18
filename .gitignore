@@ -1,0 +1,12 @@
+# 编译产物
+/bin/
+/worker_lightweight
+
+# 运行时：PID 文件与日志
+/run/
+/logs/
+
+# SQLite 数据库（含 WAL/SHM 临时文件）
+*.db
+*.db-shm
+*.db-wal

@@ -136,8 +136,16 @@ func TestReportResultDead(t *testing.T) {
 		Name: "dead-test", Command: "false", Type: model.ScheduleOnce,
 		Status: model.StatusPending, MaxRetry: 0, // no retries allowed
 	}
-	_ = s.Create(context.Background(), task)
-	claimed, _ := s.ClaimPending(context.Background(), "w1")
+	if err := s.Create(context.Background(), task); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	claimed, err := s.ClaimPending(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("claim returned nil task")
+	}
 	if err := s.ReportResult(context.Background(), &model.Result{
 		TaskID: claimed.ID, WorkerID: "w1", Success: false, Output: "boom",
 	}); err != nil {

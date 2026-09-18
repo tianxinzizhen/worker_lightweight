@@ -1,0 +1,19 @@
+# 一次性任务（立即执行）
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name":"hello","command":"echo hello world","type":"once"}'
+
+# 慢任务（看超时）
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name":"slow","command":"sleep 5 && echo done","type":"once","timeout_sec":10}'
+
+# 会失败的任务（看重试）
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name":"fail","command":"exit 1","type":"once","max_retry":3}'
+
+# 定时任务（每秒触发）
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name":"heartbeat","command":"echo beat","type":"cron","cron_expr":"* * * * * *"}'
