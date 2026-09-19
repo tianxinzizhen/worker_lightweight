@@ -10,11 +10,13 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"sync"
 	"time"
 
@@ -24,12 +26,15 @@ import (
 
 // Config tunes the worker's behaviour.
 type Config struct {
-	ID          string        // unique worker identifier reported with results
-	ServerAddr  string        // e.g. http://127.0.0.1:8080
-	Workers     int           // executor pool size
-	PullEvery   time.Duration // fetcher poll interval (rate limiting)
-	HTTPTimeout time.Duration
-	Token       string // shared secret sent as Authorization bearer; "" disables
+	ID           string        // unique worker identifier reported with results
+	ServerAddr   string        // e.g. http://127.0.0.1:8080 or https://...
+	Workers      int           // executor pool size
+	PullEvery    time.Duration // fetcher poll interval (rate limiting)
+	HTTPTimeout  time.Duration
+	Token        string // shared secret sent as Authorization bearer; "" disables
+	Insecure     bool   // skip TLS certificate verification (for self-signed certs)
+	BlockedRegex string // regex; matching commands are rejected before exec (P2-1)
+	AllowedRegex string // regex; if set, only matching commands are allowed (P2-1)
 }
 
 // Pool ties together the fetcher, executors and HTTP client.
@@ -39,6 +44,11 @@ type Pool struct {
 	jobs      chan *model.Task
 	startedAt time.Time
 
+	// P2-1 pre-compiled command filters (nil = disabled). Compiled once at
+	// construction so we don't pay the regex cost per task.
+	blockedRE *regexp.Regexp
+	allowedRE *regexp.Regexp
+
 	// active tracks in-flight tasks so the fetcher can cancel them when the
 	// server reports a stop. The mutex guards the map only; cancelling a
 	// context is safe to do without holding it.
@@ -47,21 +57,47 @@ type Pool struct {
 }
 
 // NewPool constructs a Pool. The jobs channel is buffered to workers*2 so the
-// fetcher can keep a small queue warm without blocking on every poll.
-func NewPool(cfg Config) *Pool {
+// fetcher can keep a small queue warm without blocking on every poll. Returns
+// an error if BlockedRegex or AllowedRegex fails to compile — better to catch
+// that at startup than reject tasks one at a time.
+func NewPool(cfg Config) (*Pool, error) {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
 	if cfg.HTTPTimeout == 0 {
 		cfg.HTTPTimeout = 10 * time.Second
 	}
-	return &Pool{
+
+	transport := &http.Transport{}
+	if cfg.Insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	p := &Pool{
 		cfg:       cfg,
-		client:    &http.Client{Timeout: cfg.HTTPTimeout},
+		client:    &http.Client{Timeout: cfg.HTTPTimeout, Transport: transport},
 		jobs:      make(chan *model.Task, cfg.Workers*2),
 		active:    make(map[int64]context.CancelFunc),
 		startedAt: time.Now(),
 	}
+
+	// P2-1: compile command filter regexes up front. Bad regex = fail fast.
+	if cfg.BlockedRegex != "" {
+		re, err := regexp.Compile(cfg.BlockedRegex)
+		if err != nil {
+			return nil, fmt.Errorf("blocked-commands regex compile: %w", err)
+		}
+		p.blockedRE = re
+	}
+	if cfg.AllowedRegex != "" {
+		re, err := regexp.Compile(cfg.AllowedRegex)
+		if err != nil {
+			return nil, fmt.Errorf("allowed-commands regex compile: %w", err)
+		}
+		p.allowedRE = re
+	}
+
+	return p, nil
 }
 
 // registerActive stores the cancel func for a task that just started. Called
@@ -260,7 +296,22 @@ func (p *Pool) taskTimeout(t *model.Task) time.Duration {
 // On context deadline the process is killed by CommandContext. We capture
 // both stdout and stderr: stdout on success, stderr on failure. Truncating
 // to a sane size keeps the result column readable in the UI.
+//
+// P2-1 command filter check (before exec): if allowedRE is set, the command
+// must match it or we reject; if blockedRE matches, we reject regardless.
+// This is a defense-in-depth measure — the real security boundary is the
+// operator running the worker as a restricted user — but it stops accidental
+// or malicious commands from even reaching the shell.
 func (p *Pool) exec(ctx context.Context, t *model.Task) (bool, string) {
+	if p.allowedRE != nil && !p.allowedRE.MatchString(t.Command) {
+		logger.L.Warn("command rejected: not in allowlist", "task_id", t.ID, "worker", p.cfg.ID)
+		return false, "command blocked by security policy (not matching allowed-commands)"
+	}
+	if p.blockedRE != nil && p.blockedRE.MatchString(t.Command) {
+		logger.L.Warn("command rejected: matched blocklist", "task_id", t.ID, "worker", p.cfg.ID)
+		return false, "command blocked by security policy (matched blocked-commands)"
+	}
+
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", t.Command)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

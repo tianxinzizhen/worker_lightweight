@@ -8,6 +8,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,7 +48,27 @@ func New(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// P2-3: lock down permissions so only the owner can read the database
+	// and its WAL/SHM siblings — these contain task commands and results.
+	secureDB(path)
 	return s, nil
+}
+
+// secureDB chmods the SQLite file, its -wal/-shm siblings (may not yet
+// exist), and the parent directory to owner-only access. Failure here is
+// non-fatal — log at most — because on some setups (read-only bind mounts,
+// volume mounts) chmod simply won't work, and we don't want to crash the
+// server over a permission hint.
+func secureDB(path string) {
+	files := []string{path, path + "-wal", path + "-shm", path + "-journal"}
+	for _, f := range files {
+		if _, err := os.Stat(f); err == nil {
+			_ = os.Chmod(f, 0600)
+		}
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "/" {
+		_ = os.Chmod(dir, 0700)
+	}
 }
 
 // Close releases the database handle. Safe to call once at shutdown.

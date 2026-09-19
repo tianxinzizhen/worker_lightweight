@@ -16,7 +16,20 @@
 #   SYNC_EVERY     cron 同步间隔 默认 30s
 #   LOG_LEVEL      日志级别      默认 info
 #   TOKEN          共享鉴权密钥  默认空（不启用鉴权）
+#   TLS_CERT       TLS 证书路径  默认空（不启用 HTTPS）
+#   TLS_KEY        TLS 私钥路径  默认空（不启用 HTTPS）
+#   AUDIT_LOG      审计日志路径  默认空（不启用审计）
+#   RATE_LIMIT     每分钟每IP请求上限 默认 0（不限）
 #   BIN            二进制路径    默认 ./bin/worker_lightweight（缺失自动编译）
+#
+# TLS 快速启用示例 (使用自签名证书):
+#   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+#   TLS_CERT=cert.pem TLS_KEY=key.pem SERVER_ADDR=0.0.0.0:8443 ./scripts/start_server.sh start
+#
+# 完整安全加固示例:
+#   TOKEN=secret AUDIT_LOG=./logs/audit.log RATE_LIMIT=120 \
+#   TLS_CERT=cert.pem TLS_KEY=key.pem SERVER_ADDR=0.0.0.0:8443 \
+#   ./scripts/start_server.sh start
 #
 set -uo pipefail   # 注意：不使用 set -e，kill/grep 等命令的非零退出是正常分支
 
@@ -31,6 +44,10 @@ DB_PATH="${DB_PATH:-$ROOT_DIR/data/tasks.db}"
 SYNC_EVERY="${SYNC_EVERY:-30s}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 TOKEN="${TOKEN:-}"
+TLS_CERT="${TLS_CERT:-}"
+TLS_KEY="${TLS_KEY:-}"
+AUDIT_LOG="${AUDIT_LOG:-}"
+RATE_LIMIT="${RATE_LIMIT:-0}"
 
 RUN_DIR="$ROOT_DIR/run"
 LOG_DIR="$ROOT_DIR/logs"
@@ -137,13 +154,17 @@ do_start() {
     # 清理可能残留的过期 PID 文件
     rm -f "$PID_FILE"
 
-    c_info "启动服务端: addr=$SERVER_ADDR db=$DB_PATH auth=$([ -n "$TOKEN" ] && echo yes || echo no)"
+    c_info "启动服务端: addr=$SERVER_ADDR db=$DB_PATH auth=$([ -n "$TOKEN" ] && echo yes || echo no) tls=$([ -n "$TLS_CERT" ] && echo yes || echo no) audit=$([ -n "$AUDIT_LOG" ] && echo yes || echo no) rate_limit=$RATE_LIMIT"
     nohup "$BIN" server \
         --addr "$SERVER_ADDR" \
         --db "$DB_PATH" \
         --sync-every "$SYNC_EVERY" \
         --log-level "$LOG_LEVEL" \
         ${TOKEN:+--token "$TOKEN"} \
+        ${TLS_CERT:+--tls-cert "$TLS_CERT"} \
+        ${TLS_KEY:+--tls-key "$TLS_KEY"} \
+        ${AUDIT_LOG:+--audit-log "$AUDIT_LOG"} \
+        ${RATE_LIMIT:+--rate-limit "$RATE_LIMIT"} \
         >> "$LOG_FILE" 2>&1 &
     local pid=$!
     echo "$pid" > "$PID_FILE"

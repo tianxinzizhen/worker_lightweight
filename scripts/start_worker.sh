@@ -11,13 +11,23 @@
 #   ./scripts/start_worker.sh logs
 #
 # 可用环境变量覆盖默认值:
-#   SERVER_ADDR   服务端地址    默认 http://127.0.0.1:8080
-#   WORKER_ID     节点标识      默认 worker-1
-#   WORKERS       并发池大小    默认 4
-#   PULL_EVERY    拉取间隔      默认 1s
-#   LOG_LEVEL     日志级别      默认 info
-#   TOKEN         共享鉴权密钥  默认空（需与服务端一致）
-#   BIN           二进制路径    默认 ./bin/worker_lightweight（缺失自动编译）
+#   SERVER_ADDR      服务端地址    默认 http://127.0.0.1:8080
+#   WORKER_ID        节点标识      默认 worker-1
+#   WORKERS          并发池大小    默认 4
+#   PULL_EVERY       拉取间隔      默认 1s
+#   LOG_LEVEL        日志级别      默认 info
+#   TOKEN            共享鉴权密钥  默认空（需与服务端一致）
+#   INSECURE         跳过 TLS 验证 默认 false（自签名证书场景设为 true）
+#   BLOCKED_COMMANDS 命令黑名单正则 默认空（不启用）
+#   ALLOWED_COMMANDS 命令白名单正则 默认空（不启用；启用时只允许匹配的命令）
+#   BIN              二进制路径    默认 ./bin/worker_lightweight（缺失自动编译）
+#
+# HTTPS 自签名证书场景:
+#   SERVER_ADDR=https://your-server:8443 INSECURE=true ./scripts/start_worker.sh start
+#
+# 带命令过滤的安全 worker:
+#   BLOCKED_COMMANDS='rm\s+-rf|mkfs' ALLOWED_COMMANDS='^(bash|python|go|curl)\s+' \
+#   ./scripts/start_worker.sh start
 #
 set -uo pipefail   # 不使用 set -e：kill/grep 的非零退出属于正常分支
 
@@ -33,6 +43,9 @@ WORKERS="${WORKERS:-4}"
 PULL_EVERY="${PULL_EVERY:-1s}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 TOKEN="${TOKEN:-}"
+INSECURE="${INSECURE:-false}"
+BLOCKED_COMMANDS="${BLOCKED_COMMANDS:-}"
+ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-}"
 
 RUN_DIR="$ROOT_DIR/run"
 LOG_DIR="$ROOT_DIR/logs"
@@ -128,7 +141,7 @@ do_start() {
     check_server_reachable
     rm -f "$PID_FILE"
 
-    c_info "启动 worker: id=$WORKER_ID workers=$WORKERS server=$SERVER_ADDR auth=$([ -n "$TOKEN" ] && echo yes || echo no)"
+    c_info "启动 worker: id=$WORKER_ID workers=$WORKERS server=$SERVER_ADDR auth=$([ -n "$TOKEN" ] && echo yes || echo no) insecure=$INSECURE blocked=$([ -n "$BLOCKED_COMMANDS" ] && echo yes || echo no) allowed=$([ -n "$ALLOWED_COMMANDS" ] && echo yes || echo no)"
     nohup "$BIN" worker \
         --server "$SERVER_ADDR" \
         --id "$WORKER_ID" \
@@ -136,6 +149,9 @@ do_start() {
         --pull-every "$PULL_EVERY" \
         --log-level "$LOG_LEVEL" \
         ${TOKEN:+--token "$TOKEN"} \
+        $([ "$INSECURE" = "true" ] && echo "--insecure") \
+        ${BLOCKED_COMMANDS:+--blocked-commands "$BLOCKED_COMMANDS"} \
+        ${ALLOWED_COMMANDS:+--allowed-commands "$ALLOWED_COMMANDS"} \
         >> "$LOG_FILE" 2>&1 &
     local pid=$!
     echo "$pid" > "$PID_FILE"

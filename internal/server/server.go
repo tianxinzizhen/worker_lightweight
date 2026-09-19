@@ -8,7 +8,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,17 +68,26 @@ func (r *workerRegistry) List() []*model.WorkerInfo {
 // Server owns the store, scheduler and HTTP listener. All fields are set in
 // New and read-only afterwards, so Server is safe for concurrent use.
 type Server struct {
-	store   *store.Store
-	sched   *Scheduler
-	workers *workerRegistry
-	httpSrv *http.Server
-	token   string // shared secret; empty disables auth (local-only mode)
+	store       *store.Store
+	sched       *Scheduler
+	workers     *workerRegistry
+	httpSrv     *http.Server
+	token       string       // shared secret; empty disables auth (local-only mode)
+	tlsCert     string       // TLS cert path; empty = plain HTTP
+	tlsKey      string       // TLS key path; empty = plain HTTP
+	auditLogger *slog.Logger // independent audit log (nil = disabled)
+	auditFile   *os.File     // underlying audit log file handle; closed in Close()
+	rateLimiter *rateLimiter // per-IP token bucket (nil = disabled)
 }
 
 // New builds a Server bound to addr. token is the shared secret required by
 // API clients and workers; pass "" to run without authentication (only safe
-// on a trusted local interface). Call Start to run the listener.
-func New(addr, dbPath string, syncEvery time.Duration, token string) (*Server, error) {
+// on a trusted local interface). tlsCert/tlsKey enable HTTPS when both are
+// set; pass empty strings for plain HTTP. auditLogger/auditFile are the
+// independent audit logger and its underlying file handle (both nil = disabled);
+// the caller must open the file and Close will close it. rateLimit is the max
+// requests per minute per IP (0 = disabled). Call Start to run the listener.
+func New(addr, dbPath string, syncEvery time.Duration, token, tlsCert, tlsKey string, auditLogger *slog.Logger, auditFile *os.File, rateLimit int) (*Server, error) {
 	st, err := store.New(dbPath)
 	if err != nil {
 		return nil, err
@@ -83,7 +95,19 @@ func New(addr, dbPath string, syncEvery time.Duration, token string) (*Server, e
 	lk := lock.NewMemory()
 	sch := NewScheduler(st, lk, syncEvery)
 	mux := http.NewServeMux()
-	s := &Server{store: st, sched: sch, workers: newWorkerRegistry(), token: token}
+	s := &Server{
+		store:       st,
+		sched:       sch,
+		workers:     newWorkerRegistry(),
+		token:       token,
+		tlsCert:     tlsCert,
+		tlsKey:      tlsKey,
+		auditLogger: auditLogger,
+		auditFile:   auditFile,
+	}
+	if rateLimit > 0 {
+		s.rateLimiter = newRateLimiter(rateLimit)
+	}
 	s.register(mux)
 	s.httpSrv = &http.Server{
 		Addr:         addr,
@@ -95,15 +119,16 @@ func New(addr, dbPath string, syncEvery time.Duration, token string) (*Server, e
 }
 
 // register attaches all routes to the mux. Grouping them here keeps routing
-// discoverable in one place. Every /api/* handler is wrapped in authMiddleware
-// so the shared token is enforced uniformly.
+// discoverable in one place. Every /api/* handler is wrapped in a three-layer
+// middleware chain: rate limit → auth → audit → handler. UI pages skip the
+// audit log but still go through auth (uiAuth, in-page token query param).
 func (s *Server) register(mux *http.ServeMux) {
-	mux.HandleFunc("/api/tasks", s.authMiddleware(s.handleTasks))
-	mux.HandleFunc("/api/tasks/", s.authMiddleware(s.handleTaskByID))
-	mux.HandleFunc("/api/pull", s.authMiddleware(s.handlePull))
-	mux.HandleFunc("/api/result", s.authMiddleware(s.handleResult))
-	mux.HandleFunc("/api/worker/heartbeat", s.authMiddleware(s.handleWorkerHeartbeat))
-	mux.HandleFunc("/api/workers", s.authMiddleware(s.handleWorkers))
+	mux.HandleFunc("/api/tasks", s.rateLimitMiddleware(s.authMiddleware(s.auditMiddleware(s.handleTasks))))
+	mux.HandleFunc("/api/tasks/", s.rateLimitMiddleware(s.authMiddleware(s.auditMiddleware(s.handleTaskByID))))
+	mux.HandleFunc("/api/pull", s.rateLimitMiddleware(s.authMiddleware(s.auditMiddleware(s.handlePull))))
+	mux.HandleFunc("/api/result", s.rateLimitMiddleware(s.authMiddleware(s.auditMiddleware(s.handleResult))))
+	mux.HandleFunc("/api/worker/heartbeat", s.rateLimitMiddleware(s.authMiddleware(s.handleWorkerHeartbeat)))
+	mux.HandleFunc("/api/workers", s.rateLimitMiddleware(s.authMiddleware(s.handleWorkers)))
 	mux.HandleFunc("/tasks/", s.renderTaskDetail)
 	mux.HandleFunc("/", s.handleUI)
 }
@@ -148,10 +173,24 @@ func (s *Server) uiAuth(r *http.Request) bool {
 }
 
 // Start runs the scheduler and HTTP listener until ctx is cancelled.
+// When tlsCert/tlsKey are configured it serves HTTPS, otherwise plain HTTP.
+// Also starts the rateLimiter cleanup goroutine if rate limiting is enabled.
 // Shutdown blocks in-progress requests up to 5s then returns.
 func (s *Server) Start(ctx context.Context) error {
 	go s.sched.Start(ctx)
-	logger.L.Info("server listening", "addr", s.httpSrv.Addr)
+	if s.rateLimiter != nil {
+		// Clean stale rate-limit entries every 5 min; IPs idle for >2h get evicted.
+		go s.rateLimiter.runCleanupPeriodically(ctx, 5*time.Minute, 2*time.Hour)
+	}
+	if s.tlsCert != "" && s.tlsKey != "" {
+		logger.L.Info("server listening (TLS)", "addr", s.httpSrv.Addr)
+		err := s.httpSrv.ListenAndServeTLS(s.tlsCert, s.tlsKey)
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+	logger.L.Info("server listening (plain HTTP)", "addr", s.httpSrv.Addr)
 	err := s.httpSrv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -166,8 +205,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpSrv.Shutdown(ctx)
 }
 
-// Close releases store resources after Shutdown completes.
-func (s *Server) Close() error { return s.store.Close() }
+// Close releases all resources: the store and the audit log file handle.
+// Safe to call once at shutdown. Audit log errors are logged but don't
+// mask a store close error since that's the more important resource.
+func (s *Server) Close() error {
+	var err error
+	if s.auditFile != nil {
+		if cerr := s.auditFile.Close(); cerr != nil {
+			logger.L.Warn("audit file close failed", "err", cerr)
+		}
+	}
+	if serr := s.store.Close(); serr != nil {
+		err = serr
+	}
+	return err
+}
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -503,4 +555,165 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 // handleUI renders the simple task dashboard. Implemented in ui.go.
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	s.renderUI(w, r)
+}
+
+// ---- P2-2 审计日志 ----------------------------------------------------------
+
+// captureWriter wraps http.ResponseWriter to capture the final status code
+// written by the downstream handler. auditMiddleware uses it to log the
+// outcome after the handler returns.
+type captureWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func newCaptureWriter(w http.ResponseWriter) *captureWriter {
+	return &captureWriter{ResponseWriter: w, status: http.StatusOK}
+}
+
+func (cw *captureWriter) WriteHeader(code int) {
+	cw.status = code
+	cw.ResponseWriter.WriteHeader(code)
+}
+
+// clientIP extracts the best-guess client IP from a request, respecting
+// X-Forwarded-For headers (first non-trusted entry) and falling back to
+// RemoteAddr. Stripped of port for cleaner logs.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host == "" {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// auditMiddleware wraps a handler and writes a structured audit record after
+// it returns. Fields: time, client IP, method, path, task_id (when present),
+// and HTTP status. Skipped when auditLogger is nil.
+func (s *Server) auditMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.auditLogger == nil {
+			next(w, r)
+			return
+		}
+		cw := newCaptureWriter(w)
+		next(cw, r)
+
+		// Extract task id from paths like /api/tasks/123 or /api/tasks/123/pause
+		taskID := ""
+		if strings.HasPrefix(r.URL.Path, "/api/tasks/") {
+			parts := strings.Split(r.URL.Path[len("/api/tasks/"):], "/")
+			if len(parts) > 0 {
+				taskID = parts[0]
+			}
+		}
+
+		s.auditLogger.Info("audit",
+			"ts", time.Now().UTC().Format(time.RFC3339),
+			"remote_ip", clientIP(r),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"query", r.URL.RawQuery,
+			"task_id", taskID,
+			"status", cw.status,
+		)
+	}
+}
+
+// ---- P3-1 速率限制 ----------------------------------------------------------
+
+// rateLimiter is a tiny in-memory per-client token bucket. Clients that
+// exhaust their tokens get 429 Too Many Requests. It's intentionally simple
+// — no external state, no precise fairness — good enough for a lightweight
+// scheduler where DoS risk is modest.
+type rateLimiter struct {
+	mu     sync.Mutex
+	tokens map[string]float64
+	last   map[string]time.Time
+	perMin float64 // capacity + refill rate
+}
+
+func newRateLimiter(perMin int) *rateLimiter {
+	return &rateLimiter{
+		tokens: make(map[string]float64),
+		last:   make(map[string]time.Time),
+		perMin: float64(perMin),
+	}
+}
+
+// allow returns true if the client identified by key has a token available.
+// A request consumes one token; tokens refill linearly over time up to the
+// perMin ceiling.
+func (rl *rateLimiter) allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	tokens, ok := rl.tokens[key]
+	if !ok {
+		tokens = rl.perMin // fresh client starts with full bucket
+	} else {
+		elapsed := now.Sub(rl.last[key]).Minutes()
+		tokens += elapsed * rl.perMin
+		if tokens > rl.perMin {
+			tokens = rl.perMin
+		}
+	}
+	if tokens < 1 {
+		rl.last[key] = now
+		rl.tokens[key] = tokens
+		return false
+	}
+	tokens--
+	rl.last[key] = now
+	rl.tokens[key] = tokens
+	return true
+}
+
+// cleanup removes stale entries whose last access is older than the given
+// TTL. Prevents unbounded growth of the per-client maps on long-running
+// servers. Called periodically from a goroutine in Server.Start.
+func (rl *rateLimiter) cleanup(ttl time.Duration) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	cutoff := time.Now().Add(-ttl)
+	for k, t := range rl.last {
+		if t.Before(cutoff) {
+			delete(rl.tokens, k)
+			delete(rl.last, k)
+		}
+	}
+}
+
+// runCleanupPeriodically calls cleanup every interval until ctx is cancelled.
+func (rl *rateLimiter) runCleanupPeriodically(ctx context.Context, interval, ttl time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rl.cleanup(ttl)
+		}
+	}
+}
+
+// rateLimitMiddleware returns 429 if the client IP has exceeded the per-minute
+// request budget. Disabled when rateLimiter is nil.
+func (s *Server) rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.rateLimiter != nil && !s.rateLimiter.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next(w, r)
+	}
 }
